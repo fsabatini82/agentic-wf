@@ -1,0 +1,158 @@
+name: Scheduled Code Review (curl variant — full control)
+
+# Variant B: bypass actions/ai-inference and call GitHub Models directly
+# via curl. This gives FULL control over the JSON body — including
+# `max_completion_tokens` for GPT-5 family models.
+#
+# Use this if scheduled-review.yml (Variant A using actions/ai-inference)
+# fails on a 400 error related to max_tokens / max_completion_tokens.
+#
+# To activate ONLY this workflow and disable the other:
+# - Either delete scheduled-review.yml
+# - Or comment out its `on:` triggers
+# Otherwise you'd have two scheduled runs producing duplicate artifacts.
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '0 6 * * 1'   # uncomment to enable weekly schedule
+
+permissions:
+  contents: read
+  models: read
+  actions: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    env:
+      MODEL: openai/gpt-5-mini
+      ENDPOINT: https://models.github.ai/inference/chat/completions
+      MAX_COMPLETION_TOKENS: '1500'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare working directories
+        run: mkdir -p build out
+
+      - name: Bundle C# source files
+        run: |
+          {
+            echo "Below is the full source of a small C# project. Review it according to your system instructions."
+            echo
+            for f in $(find . -maxdepth 2 -name '*.cs' | sort); do
+              echo "## File: $f"
+              echo '```csharp'
+              cat "$f"
+              echo '```'
+              echo
+            done
+          } > build/source-bundle.md
+
+      - name: Extract agent system prompts (strip YAML frontmatter)
+        run: |
+          strip_frontmatter() {
+            awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$1"
+          }
+          strip_frontmatter .github/agents/code-reviewer.agent.md > build/code-reviewer-prompt.md
+          strip_frontmatter .github/agents/doc-writer.agent.md   > build/doc-writer-prompt.md
+
+      # ===============================================================
+      # Helper function: call GitHub Models, write response to a file
+      # ===============================================================
+      - name: Run code-reviewer (curl)
+        env:
+          GH_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          PAYLOAD=$(jq -n \
+            --arg model "${MODEL}" \
+            --arg sys "$(cat build/code-reviewer-prompt.md)" \
+            --arg usr "$(cat build/source-bundle.md)" \
+            --argjson maxct "${MAX_COMPLETION_TOKENS}" \
+            '{
+               model: $model,
+               messages: [
+                 {role: "system", content: $sys},
+                 {role: "user",   content: $usr}
+               ],
+               max_completion_tokens: $maxct
+             }')
+
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" \
+            -X POST "${ENDPOINT}" \
+            -H "Authorization: Bearer ${GH_MODELS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "${PAYLOAD}")
+
+          echo "HTTP ${HTTP_CODE}"
+          if [ "${HTTP_CODE}" -ne 200 ]; then
+            echo "::error::API call failed with HTTP ${HTTP_CODE}"
+            cat response.json
+            exit 1
+          fi
+
+          jq -r '.choices[0].message.content' response.json > out/code-review.md
+          echo "::notice::Code review saved ($(wc -l < out/code-review.md) lines)"
+
+      - name: Run doc-writer (curl)
+        env:
+          GH_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          PAYLOAD=$(jq -n \
+            --arg model "${MODEL}" \
+            --arg sys "$(cat build/doc-writer-prompt.md)" \
+            --arg usr "$(cat build/source-bundle.md)" \
+            --argjson maxct "${MAX_COMPLETION_TOKENS}" \
+            '{
+               model: $model,
+               messages: [
+                 {role: "system", content: $sys},
+                 {role: "user",   content: $usr}
+               ],
+               max_completion_tokens: $maxct
+             }')
+
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" \
+            -X POST "${ENDPOINT}" \
+            -H "Authorization: Bearer ${GH_MODELS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "${PAYLOAD}")
+
+          echo "HTTP ${HTTP_CODE}"
+          if [ "${HTTP_CODE}" -ne 200 ]; then
+            echo "::error::API call failed with HTTP ${HTTP_CODE}"
+            cat response.json
+            exit 1
+          fi
+
+          jq -r '.choices[0].message.content' response.json > out/code-doc.md
+          echo "::notice::Doc saved ($(wc -l < out/code-doc.md) lines)"
+
+      - name: Upload reports as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-reports-curl-${{ github.run_id }}
+          path: out/
+
+      - name: Job summary
+        run: |
+          {
+            echo "## Curl variant — review complete"
+            echo
+            echo "- **Model**: \`${MODEL}\`"
+            echo "- **Endpoint**: \`${ENDPOINT}\`"
+            echo "- **max_completion_tokens**: ${MAX_COMPLETION_TOKENS}"
+            echo
+            echo "### Code Review (preview)"
+            echo
+            head -40 out/code-review.md || true
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,224 @@
+name: Review + Upload via HTTP REST (manual demo)
+
+# Demo workflow per la sessione live: stesso flusso di scheduled-review.yml
+# (genera code-review e doc usando actions/ai-inference + GitHub Models),
+# poi POSTa i due file su un endpoint HTTP REST esterno.
+#
+# Schedule disabilitato di proposito — solo manual dispatch per la demo.
+# Per attivare il cron in produzione, decommenta il blocco `schedule:`.
+#
+# Secrets richiesti nel repo (Settings → Secrets and variables → Actions):
+#   HTTP_UPLOAD_URL      endpoint che accetta POST multipart/form-data
+#                        es: https://compliance.acme.io/api/upload
+#   HTTP_UPLOAD_TOKEN    Bearer token / API key per autenticare
+#
+# Endpoint atteso (esempio):
+#   POST $HTTP_UPLOAD_URL
+#   Headers: Authorization: Bearer <token>
+#   Body: multipart/form-data con campi:
+#     - repo          (testo, formato owner/repo)
+#     - review_date   (testo, ISO date)
+#     - file_name     (testo, nome del file caricato)
+#     - file          (binario, il contenuto del .md)
+
+on:
+  # schedule:
+  #   - cron: '0 6 * * 1'      # uncomment for weekly Monday 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      run_doc_writer:
+        description: "Also run the doc-writer agent (default true)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      dry_run:
+        description: "Skip actual HTTP POST, just log what would happen"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+  models: read
+  actions: write
+
+jobs:
+  review-and-upload:
+    runs-on: ubuntu-latest
+
+    env:
+      MODEL: openai/gpt-5-mini   # see scheduled-review.yml for notes on GPT-5 family
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare working directories
+        run: mkdir -p build out
+
+      # ===============================================================
+      # 1. Bundle source code into a single prompt input
+      # ===============================================================
+      - name: Bundle C# source files
+        run: |
+          {
+            echo "Below is the full source of a small C# project. Review it according to your system instructions."
+            echo
+            for f in $(find . -maxdepth 2 -name '*.cs' | sort); do
+              echo "## File: $f"
+              echo '```csharp'
+              cat "$f"
+              echo '```'
+              echo
+            done
+          } > build/source-bundle.md
+
+      - name: Extract agent system prompts
+        run: |
+          strip_frontmatter() {
+            awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$1"
+          }
+          strip_frontmatter .github/agents/code-reviewer.agent.md > build/code-reviewer-prompt.md
+          strip_frontmatter .github/agents/doc-writer.agent.md   > build/doc-writer-prompt.md
+
+      # ===============================================================
+      # 2. Run code-reviewer
+      # ===============================================================
+      - name: Run code-reviewer
+        uses: actions/ai-inference@v1
+        id: code_review
+        with:
+          model: ${{ env.MODEL }}
+          system-prompt-file: build/code-reviewer-prompt.md
+          prompt-file: build/source-bundle.md
+
+      - name: Save code-review output
+        run: |
+          cat > out/code-review.md <<'EOF'
+          ${{ steps.code_review.outputs.response }}
+          EOF
+          echo "::notice::Code review written ($(wc -l < out/code-review.md) lines)"
+
+      # ===============================================================
+      # 3. Run doc-writer (optional)
+      # ===============================================================
+      - name: Run doc-writer
+        if: github.event.inputs.run_doc_writer != 'false'
+        uses: actions/ai-inference@v1
+        id: doc_writer
+        with:
+          model: ${{ env.MODEL }}
+          system-prompt-file: build/doc-writer-prompt.md
+          prompt-file: build/source-bundle.md
+
+      - name: Save doc-writer output
+        if: github.event.inputs.run_doc_writer != 'false'
+        run: |
+          cat > out/code-doc.md <<'EOF'
+          ${{ steps.doc_writer.outputs.response }}
+          EOF
+          echo "::notice::Doc written ($(wc -l < out/code-doc.md) lines)"
+
+      # ===============================================================
+      # 4. Upload via HTTP REST (multipart/form-data POST)
+      # ===============================================================
+      - name: Upload reports via HTTP POST
+        env:
+          HTTP_UPLOAD_URL: ${{ secrets.HTTP_UPLOAD_URL }}
+          HTTP_UPLOAD_TOKEN: ${{ secrets.HTTP_UPLOAD_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HTTP_UPLOAD_URL:-}" ]; then
+            echo "::error::Secret HTTP_UPLOAD_URL is not set."
+            exit 1
+          fi
+          if [ -z "${HTTP_UPLOAD_TOKEN:-}" ]; then
+            echo "::error::Secret HTTP_UPLOAD_TOKEN is not set."
+            exit 1
+          fi
+
+          REVIEW_DATE=$(date -u +'%Y-%m-%d')
+          REPO_FULL="${{ github.repository }}"
+          UPLOAD_COUNT=0
+          UPLOAD_ERRORS=0
+
+          for f in out/*.md; do
+            [ -f "$f" ] || continue
+            NAME=$(basename "$f")
+            SIZE=$(wc -c < "$f")
+
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "[DRY-RUN] would POST $NAME (${SIZE} bytes) to ${HTTP_UPLOAD_URL}"
+              UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
+              continue
+            fi
+
+            echo "Uploading $NAME (${SIZE} bytes)..."
+
+            HTTP_CODE=$(curl -sS -o "/tmp/upload-response-${NAME}.txt" -w "%{http_code}" \
+              --fail-with-body \
+              -X POST "${HTTP_UPLOAD_URL}" \
+              -H "Authorization: Bearer ${HTTP_UPLOAD_TOKEN}" \
+              -F "repo=${REPO_FULL}" \
+              -F "review_date=${REVIEW_DATE}" \
+              -F "file_name=${NAME}" \
+              -F "file=@${f}" || echo "FAIL")
+
+            if [ "${HTTP_CODE}" = "FAIL" ] || [ "${HTTP_CODE:0:1}" != "2" ]; then
+              echo "::error::Upload failed for $NAME — HTTP ${HTTP_CODE}"
+              echo "Response body:"
+              cat "/tmp/upload-response-${NAME}.txt" || true
+              UPLOAD_ERRORS=$((UPLOAD_ERRORS + 1))
+            else
+              echo "  -> HTTP ${HTTP_CODE} OK"
+              UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
+            fi
+          done
+
+          echo "UPLOAD_COUNT=${UPLOAD_COUNT}" >> "$GITHUB_ENV"
+          echo "UPLOAD_ERRORS=${UPLOAD_ERRORS}" >> "$GITHUB_ENV"
+
+          if [ "${UPLOAD_ERRORS}" -gt 0 ]; then
+            echo "::warning::${UPLOAD_ERRORS} file failed to upload. See logs above."
+            exit 1
+          fi
+
+          echo "::notice::Uploaded ${UPLOAD_COUNT} file(s) to ${HTTP_UPLOAD_URL}"
+
+      # ===============================================================
+      # 5. Backup: artifact upload (sempre, per debug)
+      # ===============================================================
+      - name: Upload reports also as artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-reports-http-${{ github.run_id }}
+          path: out/
+          retention-days: 7
+
+      # ===============================================================
+      # 6. Job summary
+      # ===============================================================
+      - name: Job summary
+        run: |
+          {
+            echo "## Review + HTTP upload — manual demo"
+            echo
+            echo "- **Model**: \`${MODEL}\`"
+            echo "- **Endpoint**: \`${{ secrets.HTTP_UPLOAD_URL && 'configured' || 'NOT SET' }}\`"
+            echo "- **Dry run**: ${{ github.event.inputs.dry_run }}"
+            echo "- **Files uploaded**: ${UPLOAD_COUNT:-0}"
+            echo "- **Errors**: ${UPLOAD_ERRORS:-0}"
+            echo
+            echo "### Code Review (preview)"
+            echo
+            head -40 out/code-review.md || true
+          } >> "$GITHUB_STEP_SUMMARY"

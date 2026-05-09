@@ -172,9 +172,10 @@ Per cambiare cadenza: edita `.github/workflows/scheduled-review.yml` riga `- cro
 
 | Problema | Causa | Fix |
 |----------|-------|-----|
+| `400 Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.` | Modelli famiglia **GPT-5** (gpt-5-mini, gpt-5-3-codex, ecc.) hanno cambiato API: vogliono `max_completion_tokens`. `actions/ai-inference@v1` invia ancora il legacy `max_tokens`. | Due opzioni: **(A)** usa `openai/gpt-4o-mini` come `MODEL` (cambiato di default in questo template — stessa fascia costo/qualita', funziona). **(B)** rimuovi del tutto l'input `max-tokens:` dall'action (gia' fatto in questo template). Quando `actions/ai-inference` supportera' GPT-5, potrai tornare a `gpt-5-mini`. |
 | Workflow fail su `actions/ai-inference` con `403` | GitHub Models non abilitato sull'account | Vai su [marketplace/models](https://github.com/marketplace/models) e accetta i terms |
-| `model not found: openai/gpt-5-mini` | Modello non disponibile nel catalog del tuo plan | Edita `MODEL` in `scheduled-review.yml` a `openai/gpt-4o-mini` (sempre disponibile) |
-| Output vuoto in `out/code-review.md` | `max-tokens` troppo basso o prompt malformato | Aumenta `max-tokens` a 2500, controlla i log dello step `Run code-reviewer` |
+| `model not found: openai/<modello>` | Modello non disponibile nel catalog del tuo plan | Edita `MODEL` in `scheduled-review.yml` con un modello disponibile — `openai/gpt-4o-mini` e' il piu' affidabile |
+| Output vuoto in `out/code-review.md` | Prompt malformato o quota esaurita | Controlla i log dello step `Run code-reviewer`; se output e' troncato, aggiungi `max-tokens: 2500` (solo per modelli non GPT-5) |
 | `permissions` error | Repo permette solo read | Settings → Actions → Read and write permissions |
 | Artifact non appare | Step `Save code-review output` fallito | Controlla i log: spesso e' un escape problem nel `cat <<EOF` |
 
@@ -186,6 +187,28 @@ GitHub Models con `gpt-5-mini`:
 - Costo per run: trascurabile, **rientra nel free tier mensile** di GitHub Models per la maggior parte degli account
 
 Su free tier puoi fare ~50-100 run/mese senza pagare nulla. Weekly = 4 run/mese ≪ limit.
+
+## Due varianti del workflow
+
+In `.github/workflows/` ci sono **due workflow** che fanno la stessa cosa con strategie diverse:
+
+| File | Approccio | Modello | Quando usarla |
+|------|-----------|---------|---------------|
+| `scheduled-review.yml` | `actions/ai-inference@v1` (action ufficiale) | `openai/gpt-5-mini` con `max-tokens` rimosso | **Default**: setup minimo, manutenzione zero |
+| `scheduled-review-curl.yml` | `curl` diretto sull'endpoint GitHub Models | `openai/gpt-5-mini` con controllo completo del JSON body | **Fallback**: se la prima fallisce con errori `max_tokens` o vuoi pinnare `max_completion_tokens`, temperatura, ecc. |
+
+**La variante curl** (Variant B) e' utile perche':
+- Manda direttamente `max_completion_tokens` (nuovo campo richiesto da GPT-5 family) — niente quirk dell'action wrapper
+- Permette di settare anche `temperature`, `top_p`, `response_format` — controllo completo
+- Funziona con qualsiasi modello del catalog GitHub Models
+- Nessuna dipendenza da action di terze parti che potrebbero cambiare schema
+
+Lo svantaggio: e' piu' codice (~30 righe vs 5 con l'action). Se l'action funziona, usala. Se no, switcha alla curl.
+
+**Per attivare solo una delle due** (evitare doppia run schedulata):
+- Mantieni `on: schedule` solo nel file che vuoi attivo
+- Nell'altro file commenta o elimina il blocco `schedule:`
+- Oppure rinomina con estensione diversa (es. `.yml.disabled`)
 
 ## Estensioni naturali
 
@@ -210,3 +233,107 @@ Una volta che il base funziona, puoi:
 | Adatto a | Bug fix, feature implementation, PR review interattive | **Audit, doc generation, classification — task one-shot** |
 
 In sintesi: il Coding Agent e' un "junior dev" che lavora in autonomia. Questo workflow e' uno "static analyzer LLM-based" — meno potente, ma costo controllato e modello deterministico. Per audit schedulati e' di solito quello che serve.
+
+## FAQ
+
+Dove monitorare i costi
+
+Account personale:
+
+https://github.com/settings/billing/plans_and_usage → sezione GitHub Copilot (AI Credit), GitHub Actions (minuti runner), GitHub Models (free tier residuo)
+
+Imposta uno spending limit dalla stessa pagina per non avere sorprese
+Account org:
+
+https://github.com/organizations/<ORG>/settings/billing/plans_and_usage — stessa struttura, aggregata
+
+Per gpt-5-mini specificamente: con un workflow weekly da 2 chiamate (~5k input + ~1k output ciascuna), rientri quasi sempre nel free tier o nel buffer di AI Credit inclusi. Pratica: dopo le prime 2-3 run guarda la dashboard, vedrai un consumo trascurabile (frazione di centesimo per run). Per il setup ex-1 come configurato, costo atteso ≈ $0.
+
+Push report verso API esterna o SFTP
+
+Nel doc trovi gli snippet pronti (sezione "Aggiungere upload SFTP / HTTP a ex-1/"). Sintesi:
+
+SFTP (con lftp):
+
+Aggiungi 4 secrets: SFTP_HOST, SFTP_USER, SFTP_PASSWORD o SFTP_PRIVATE_KEY, SFTP_REMOTE_PATH
+Inserisci 3 step nel workflow: install lftp → configura key (se SSH key) → mput out/*.md su path strutturato per repo+data
+Testa con lftp da locale prima
+HTTP (con curl):
+
+Aggiungi 2 secrets: HTTP_UPLOAD_URL, HTTP_UPLOAD_TOKEN
+Inserisci 1 step nel workflow: loop sui file, curl -X POST -F "file=@..."
+Testa con curl da locale prima
+Entrambi gli step vanno dopo Save code-review output e prima di Upload reports as artifact. Riferimento completo (con switch SFTP|HTTP gia' integrato): repo-template/.github/workflows/02-publish-review.yml del lab.
+
+Chiarimenti:
+
+1. Coding Agent per review + scheduling
+Sì, fattibile schedulando un cron che crea l'issue assegnata a @copilot. Vincolo: gira sempre con modello "Auto" — non puoi forzare gpt-5-mini da workflow.
+
+2. Selezione modello nel Coding Agent
+Solo dalla UI quando assegni manualmente l'issue (picker con Auto/Sonnet/Opus/GPT-5.x). Da workflow non si può, feature request aperta ma non ancora implementata. Workaround: notify-and-reassign manuale.
+
+3. actions/ai-inference vs GitHub Agentic Workflows
+
+Sono due cose diverse:
+
+actions/ai-inference@v1: action marketplace, una chiamata one-shot al modello via GitHub Models. È quello che usa il nostro esempio.
+
+GitHub Agentic Workflows (gh-aw): framework superiore per orchestrare multi-agent + tool + MCP in flow markdown. In evoluzione, alcune feature ancora in preview.
+
+Lo riconosci dalla riga uses: actions/ai-inference@v1 nel YAML. Se vedessi gh aw run ... o file con direttive gh-aw specifiche, saresti sull'altro.
+
+4. Foundry / OpenAI direct / Claude direct / modelli esterni
+
+Tutti supportati tramite Opzione C (API LLM diretta con curl). Nel doc trovi snippet pronti per:
+
+OpenAI direct (api.openai.com) — secret OPENAI_API_KEY
+Anthropic Claude direct (api.anthropic.com) — formato leggermente diverso da OpenAI
+Azure OpenAI / Foundry — secret + endpoint deployment-specific, supporta OIDC federation per evitare key statiche
+Vincolo importante: il Coding Agent (Opzione A) NON supporta modelli esterni — gira solo sul catalog Copilot. Per Claude Opus puro, Foundry, Gemini, ecc., devi passare da Opzione C.
+
+RECAP OPZIONE A (CODING AGENT) VS OPZIONE B (AI-INFERENCE) VS OPZIONE C (API DIRETTA)
+
+Vantaggio Opzione C su B: niente moltiplicatori Copilot (Opus 4.7 in Copilot ha moltiplicatore 27× — diretto via Anthropic costa il prezzo "vero"), quota separata dal team, possibile data residency su Azure region UE.
+
+Caratteristiche dei due nuovi workflow
+
+Tratti comuni:
+
+Stesso flusso review (bundle → strip frontmatter → ai-inference × 2) di scheduled-review.yml
+gpt-5-mini come default (con fallback gpt-4o-mini documentato)
+Schedule commentato — solo workflow_dispatch per la demo (decommenti il cron: quando vai in produzione)
+Artifact backup sempre upload-ato (if: always()) — anche se l'upload esterno fallisce, hai i file scaricabili dalla run
+Job summary con preview del code-review
+Verifica esistenza secrets prima di tentare l'upload (fail-fast con messaggio chiaro)
+Specifiche SFTP (review-and-upload-sftp.yml):
+
+Supporto sia password sia chiave SSH (rileva quale è impostata)
+Path remoto strutturato: ${SFTP_REMOTE_PATH}/<owner>/<repo>/<YYYY-MM-DD> — ogni run finisce in cartella distinta
+Pre-trust dell'host (ssh-keyscan) per evitare prompt interattivi con chiave SSH
+Porta configurabile (default 22)
+Secrets richiesti: SFTP_HOST, SFTP_USER, SFTP_PASSWORD o SFTP_PRIVATE_KEY, SFTP_REMOTE_PATH, opzionale SFTP_PORT
+Specifiche HTTP (review-and-upload-http.yml):
+
+Multipart/form-data con campi: repo, review_date, file_name, file
+Bearer token nell'header Authorization
+Loop sui file con tracking di success/error count
+Input dry_run: se selezionato a true non invia la POST ma logga cosa farebbe — utile per la demo per mostrare il flusso senza dipendere da un endpoint reale
+Fail del job se almeno un file fallisce (con esito riportato nel summary)
+Secrets richiesti: HTTP_UPLOAD_URL, HTTP_UPLOAD_TOKEN
+
+
+DEMO LIVE:
+
+Per SFTP:
+
+Imposta i 4 secrets in Settings → Secrets and variables → Actions (puoi usare un server SFTP demo tipo sftpcloud.io per ottenere credenziali temporanee gratis)
+Actions → Review + Upload via SFTP (manual demo) → Run workflow
+La run gira in 30-60s, mostra l'upload nei log, e committa i file artifact come backup
+
+Per HTTP:
+
+Senza endpoint reale: vai su webhook.site, copia l'URL univoco, settalo come HTTP_UPLOAD_URL, metti un token finto come HTTP_UPLOAD_TOKEN. La pagina webhook.site mostrerà la POST in arrivo con headers e file in tempo reale — ottimo per dimostrare il flusso ai partecipanti
+
+Actions → Review + Upload via HTTP REST (manual demo) → Run workflow
+Lascia dry_run: false per la demo "vera" oppure dry_run: true se vuoi solo mostrare il flusso senza endpoint configurato

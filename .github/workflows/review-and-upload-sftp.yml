@@ -1,0 +1,196 @@
+name: Review + Upload via SFTP (manual demo)
+
+# Demo workflow per la sessione live: stesso flusso di scheduled-review.yml
+# (genera code-review e doc usando actions/ai-inference + GitHub Models),
+# poi carica i due file su un server SFTP usando lftp.
+#
+# Schedule disabilitato di proposito — solo manual dispatch per la demo.
+# Per attivare il cron in produzione, decommenta il blocco `schedule:`.
+#
+# Secrets richiesti nel repo (Settings → Secrets and variables → Actions):
+#   SFTP_HOST            host o IP del server SFTP
+#   SFTP_USER            username
+#   SFTP_PASSWORD        password (se autenticazione password)
+#   SFTP_PRIVATE_KEY     chiave SSH privata (se autenticazione key — alternativa a PASSWORD)
+#   SFTP_REMOTE_PATH     path remoto base, es. /uploads/reviews
+#   SFTP_PORT            opzionale, default 22
+
+on:
+  # schedule:
+  #   - cron: '0 6 * * 1'      # uncomment for weekly Monday 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      run_doc_writer:
+        description: "Also run the doc-writer agent (default true)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  models: read
+  actions: write
+
+jobs:
+  review-and-upload:
+    runs-on: ubuntu-latest
+
+    env:
+      MODEL: openai/gpt-5-mini   # see scheduled-review.yml for notes on GPT-5 family
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare working directories
+        run: mkdir -p build out
+
+      # ===============================================================
+      # 1. Bundle source code into a single prompt input
+      # ===============================================================
+      - name: Bundle C# source files
+        run: |
+          {
+            echo "Below is the full source of a small C# project. Review it according to your system instructions."
+            echo
+            for f in $(find . -maxdepth 2 -name '*.cs' | sort); do
+              echo "## File: $f"
+              echo '```csharp'
+              cat "$f"
+              echo '```'
+              echo
+            done
+          } > build/source-bundle.md
+
+      - name: Extract agent system prompts
+        run: |
+          strip_frontmatter() {
+            awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$1"
+          }
+          strip_frontmatter .github/agents/code-reviewer.agent.md > build/code-reviewer-prompt.md
+          strip_frontmatter .github/agents/doc-writer.agent.md   > build/doc-writer-prompt.md
+
+      # ===============================================================
+      # 2. Run code-reviewer
+      # ===============================================================
+      - name: Run code-reviewer
+        uses: actions/ai-inference@v1
+        id: code_review
+        with:
+          model: ${{ env.MODEL }}
+          system-prompt-file: build/code-reviewer-prompt.md
+          prompt-file: build/source-bundle.md
+
+      - name: Save code-review output
+        run: |
+          cat > out/code-review.md <<'EOF'
+          ${{ steps.code_review.outputs.response }}
+          EOF
+          echo "::notice::Code review written ($(wc -l < out/code-review.md) lines)"
+
+      # ===============================================================
+      # 3. Run doc-writer (optional)
+      # ===============================================================
+      - name: Run doc-writer
+        if: github.event.inputs.run_doc_writer != 'false'
+        uses: actions/ai-inference@v1
+        id: doc_writer
+        with:
+          model: ${{ env.MODEL }}
+          system-prompt-file: build/doc-writer-prompt.md
+          prompt-file: build/source-bundle.md
+
+      - name: Save doc-writer output
+        if: github.event.inputs.run_doc_writer != 'false'
+        run: |
+          cat > out/code-doc.md <<'EOF'
+          ${{ steps.doc_writer.outputs.response }}
+          EOF
+          echo "::notice::Doc written ($(wc -l < out/code-doc.md) lines)"
+
+      # ===============================================================
+      # 4. Upload via SFTP
+      # ===============================================================
+      - name: Install lftp
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lftp
+
+      - name: Configure SSH key (only if SFTP_PRIVATE_KEY is set)
+        if: env.SFTP_PRIVATE_KEY != ''
+        env:
+          SFTP_PRIVATE_KEY: ${{ secrets.SFTP_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SFTP_PRIVATE_KEY" > ~/.ssh/id_sftp
+          chmod 600 ~/.ssh/id_sftp
+          # Also pre-trust the host to avoid interactive confirmation
+          ssh-keyscan -p "${{ secrets.SFTP_PORT || '22' }}" "${{ secrets.SFTP_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Upload reports via SFTP
+        env:
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USER: ${{ secrets.SFTP_USER }}
+          SFTP_PASSWORD: ${{ secrets.SFTP_PASSWORD }}
+          SFTP_REMOTE_PATH: ${{ secrets.SFTP_REMOTE_PATH }}
+        run: |
+          set -euo pipefail
+          PORT="${SFTP_PORT:-22}"
+
+          # Path remoto strutturato: <base>/<owner>/<repo>/<YYYY-MM-DD>
+          REMOTE_DIR="${SFTP_REMOTE_PATH%/}/${{ github.repository }}/$(date -u +'%Y-%m-%d')"
+
+          # Build credentials string: prefer key, fall back to password
+          if [ -f ~/.ssh/id_sftp ]; then
+            AUTH_OPTS="-u ${SFTP_USER}, --key-file ~/.ssh/id_sftp"
+          else
+            AUTH_OPTS="-u ${SFTP_USER},${SFTP_PASSWORD}"
+          fi
+
+          echo "Uploading to sftp://${SFTP_HOST}:${PORT}${REMOTE_DIR}"
+
+          lftp -p "${PORT}" ${AUTH_OPTS} "sftp://${SFTP_HOST}" <<EOF
+          set sftp:auto-confirm yes
+          mkdir -p "${REMOTE_DIR}"
+          cd "${REMOTE_DIR}"
+          mput out/*.md
+          bye
+          EOF
+
+          echo "REMOTE_TARGET=sftp://${SFTP_HOST}${REMOTE_DIR}" >> "$GITHUB_ENV"
+          echo "::notice::Files uploaded to ${REMOTE_TARGET}"
+
+      # ===============================================================
+      # 5. Backup: artifact upload (in caso SFTP fallisca o per debug)
+      # ===============================================================
+      - name: Upload reports also as artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-reports-sftp-${{ github.run_id }}
+          path: out/
+          retention-days: 7
+
+      # ===============================================================
+      # 6. Job summary
+      # ===============================================================
+      - name: Job summary
+        run: |
+          {
+            echo "## Review + SFTP upload — manual demo"
+            echo
+            echo "- **Model**: \`${MODEL}\`"
+            echo "- **SFTP target**: \`${REMOTE_TARGET:-not set}\`"
+            echo "- **Files uploaded**:"
+            for f in out/*.md; do
+              [ -f "$f" ] && echo "  - \`$f\` ($(wc -l < "$f") lines)"
+            done
+            echo
+            echo "### Code Review (preview)"
+            echo
+            head -40 out/code-review.md || true
+          } >> "$GITHUB_STEP_SUMMARY"
