@@ -1,0 +1,143 @@
+name: Scheduled Code Review (gpt-5-mini)
+
+# Weekly automated review using GitHub Models with a fixed model.
+# Architecture note: this workflow does NOT use the Copilot Coding Agent
+# (which would run on "Auto" without model control). Instead it calls
+# GitHub Models directly via actions/ai-inference, allowing us to pin
+# gpt-5-mini for cost predictability.
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      run_doc_writer:
+        description: "Also run the doc-writer agent (default true)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  models: read           # required by actions/ai-inference for GitHub Models
+  actions: write         # required to upload artifacts
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    env:
+      MODEL: openai/gpt-5-mini   # change to openai/gpt-4o-mini if gpt-5-mini is not in your catalog
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare working directories
+        run: |
+          mkdir -p build out
+
+      # ---------------------------------------------------------------
+      # Bundle source code into a single prompt input
+      # ---------------------------------------------------------------
+      - name: Bundle C# source files
+        run: |
+          {
+            echo "Below is the full source of a small C# project. Review it according to your system instructions."
+            echo
+            for f in $(find . -maxdepth 2 -name '*.cs' | sort); do
+              echo "## File: $f"
+              echo '```csharp'
+              cat "$f"
+              echo '```'
+              echo
+            done
+          } > build/source-bundle.md
+
+          echo "Bundle size: $(wc -l < build/source-bundle.md) lines"
+
+      # ---------------------------------------------------------------
+      # Strip YAML frontmatter from agent files (the model should see
+      # only the system prompt body, not the metadata).
+      # ---------------------------------------------------------------
+      - name: Extract agent system prompts
+        run: |
+          strip_frontmatter() {
+            awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' "$1"
+          }
+          strip_frontmatter .github/agents/code-reviewer.agent.md > build/code-reviewer-prompt.md
+          strip_frontmatter .github/agents/doc-writer.agent.md   > build/doc-writer-prompt.md
+
+      # ===============================================================
+      # Run the code-reviewer agent
+      # ===============================================================
+      - name: Run code-reviewer
+        uses: actions/ai-inference@v1
+        id: code_review
+        with:
+          model: ${{ env.MODEL }}
+          system-prompt-file: build/code-reviewer-prompt.md
+          prompt-file: build/source-bundle.md
+          max-tokens: 1500
+
+      - name: Save code-review output
+        run: |
+          cat > out/code-review.md <<'EOF'
+          ${{ steps.code_review.outputs.response }}
+          EOF
+          echo "::notice::Code review written to out/code-review.md ($(wc -l < out/code-review.md) lines)"
+
+      # ===============================================================
+      # Run the doc-writer agent (skippable via input)
+      # ===============================================================
+      - name: Run doc-writer
+        if: github.event.inputs.run_doc_writer != 'false'
+        uses: actions/ai-inference@v1
+        id: doc_writer
+        with:
+          model: ${{ env.MODEL }}
+          system-prompt-file: build/doc-writer-prompt.md
+          prompt-file: build/source-bundle.md
+          max-tokens: 1500
+
+      - name: Save doc-writer output
+        if: github.event.inputs.run_doc_writer != 'false'
+        run: |
+          cat > out/code-doc.md <<'EOF'
+          ${{ steps.doc_writer.outputs.response }}
+          EOF
+          echo "::notice::Doc written to out/code-doc.md ($(wc -l < out/code-doc.md) lines)"
+
+      # ===============================================================
+      # Publish reports as workflow artifacts (downloadable from Actions)
+      # ===============================================================
+      - name: Upload reports as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-reports-${{ github.run_id }}
+          path: out/
+          retention-days: 30
+
+      # ===============================================================
+      # Summary visible in the Actions run page
+      # ===============================================================
+      - name: Job summary
+        run: |
+          {
+            echo "## Scheduled review complete"
+            echo
+            echo "- **Model**: \`${MODEL}\`"
+            echo "- **Trigger**: ${{ github.event_name }}"
+            echo "- **Reports**:"
+            for f in out/*.md; do
+              [ -f "$f" ] && echo "  - \`$f\` ($(wc -l < "$f") lines)"
+            done
+            echo
+            echo "### Code Review (preview)"
+            echo
+            head -40 out/code-review.md || true
+          } >> "$GITHUB_STEP_SUMMARY"
