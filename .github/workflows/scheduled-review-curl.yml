@@ -1,4 +1,4 @@
-name: Scheduled Code Review (curl variant gpt-5-mini — full control)
+name: Scheduled Code Review (gpt-5-mini curl variant — full control)
 
 # Variant B: bypass actions/ai-inference and call GitHub Models directly
 # via curl. This gives FULL control over the JSON body — including
@@ -29,7 +29,16 @@ jobs:
     env:
       MODEL: openai/gpt-5-mini
       ENDPOINT: https://models.github.ai/inference/chat/completions
-      MAX_COMPLETION_TOKENS: '1500'
+      # IMPORTANT — gpt-5-mini is a *reasoning model*. The budget set here
+      # covers BOTH internal reasoning tokens AND the visible response.
+      # Too low (e.g. 1500) on a complex prompt means reasoning eats it
+      # all and the response comes back empty (finish_reason: "length").
+      # 6000 is a safe value for our review prompts.
+      MAX_COMPLETION_TOKENS: '6000'
+      # `low` reasoning is the right effort level for structured listing
+      # tasks (review, doc) — `medium`/`high` is overkill and burns budget.
+      # Valid values: minimal | low | medium | high.
+      REASONING_EFFORT: 'low'
 
     steps:
       - name: Checkout repository
@@ -74,13 +83,15 @@ jobs:
             --arg sys "$(cat build/code-reviewer-prompt.md)" \
             --arg usr "$(cat build/source-bundle.md)" \
             --argjson maxct "${MAX_COMPLETION_TOKENS}" \
+            --arg effort "${REASONING_EFFORT}" \
             '{
                model: $model,
                messages: [
                  {role: "system", content: $sys},
                  {role: "user",   content: $usr}
                ],
-               max_completion_tokens: $maxct
+               max_completion_tokens: $maxct,
+               reasoning_effort: $effort
              }')
 
           HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" \
@@ -97,8 +108,29 @@ jobs:
             exit 1
           fi
 
-          jq -r '.choices[0].message.content' response.json > out/code-review.md
-          echo "::notice::Code review saved ($(wc -l < out/code-review.md) lines)"
+          # ---- Diagnostics: token usage + finish reason ---------------
+          FINISH=$(jq -r '.choices[0].finish_reason // "unknown"' response.json)
+          USAGE=$(jq -c '.usage // {}' response.json)
+          REASONING_T=$(jq -r '.usage.completion_tokens_details.reasoning_tokens // 0' response.json)
+          OUTPUT_T=$(jq -r '.usage.completion_tokens // 0' response.json)
+          echo "Finish reason: ${FINISH}"
+          echo "Usage: ${USAGE}"
+          echo "Reasoning tokens: ${REASONING_T} / Total completion: ${OUTPUT_T}"
+
+          jq -r '.choices[0].message.content // ""' response.json > out/code-review.md
+          CONTENT_BYTES=$(wc -c < out/code-review.md)
+
+          if [ "${CONTENT_BYTES}" -lt 100 ]; then
+            echo "::warning::Code review content is empty or near-empty (${CONTENT_BYTES} bytes)."
+            echo "::warning::Likely cause: reasoning_tokens (${REASONING_T}) consumed the max_completion_tokens budget."
+            echo "::warning::Fix: increase MAX_COMPLETION_TOKENS env var, or set REASONING_EFFORT to 'minimal'."
+          fi
+
+          if [ "${FINISH}" = "length" ]; then
+            echo "::warning::finish_reason=length — response was truncated by token cap."
+          fi
+
+          echo "::notice::Code review saved (${CONTENT_BYTES} bytes, $(wc -l < out/code-review.md) lines)"
 
       - name: Run doc-writer (curl)
         env:
@@ -111,13 +143,15 @@ jobs:
             --arg sys "$(cat build/doc-writer-prompt.md)" \
             --arg usr "$(cat build/source-bundle.md)" \
             --argjson maxct "${MAX_COMPLETION_TOKENS}" \
+            --arg effort "${REASONING_EFFORT}" \
             '{
                model: $model,
                messages: [
                  {role: "system", content: $sys},
                  {role: "user",   content: $usr}
                ],
-               max_completion_tokens: $maxct
+               max_completion_tokens: $maxct,
+               reasoning_effort: $effort
              }')
 
           HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" \
@@ -134,8 +168,19 @@ jobs:
             exit 1
           fi
 
-          jq -r '.choices[0].message.content' response.json > out/code-doc.md
-          echo "::notice::Doc saved ($(wc -l < out/code-doc.md) lines)"
+          FINISH=$(jq -r '.choices[0].finish_reason // "unknown"' response.json)
+          REASONING_T=$(jq -r '.usage.completion_tokens_details.reasoning_tokens // 0' response.json)
+          OUTPUT_T=$(jq -r '.usage.completion_tokens // 0' response.json)
+          echo "Finish reason: ${FINISH} | reasoning: ${REASONING_T} / total: ${OUTPUT_T}"
+
+          jq -r '.choices[0].message.content // ""' response.json > out/code-doc.md
+          CONTENT_BYTES=$(wc -c < out/code-doc.md)
+
+          if [ "${CONTENT_BYTES}" -lt 100 ]; then
+            echo "::warning::Doc content empty (${CONTENT_BYTES} bytes). Reasoning consumed budget — bump MAX_COMPLETION_TOKENS."
+          fi
+
+          echo "::notice::Doc saved (${CONTENT_BYTES} bytes, $(wc -l < out/code-doc.md) lines)"
 
       # ===============================================================
       # Post code-review as a commit comment (curl variant differentiator)
@@ -150,6 +195,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+
+          # Skip if the review came back empty (e.g. reasoning consumed the
+          # entire token budget). Posting an empty comment is just noise.
+          REVIEW_BYTES=$(wc -c < out/code-review.md)
+          if [ "${REVIEW_BYTES}" -lt 100 ]; then
+            echo "::warning::Review is empty (${REVIEW_BYTES} bytes) — skipping commit comment."
+            echo "COMMENT_URL=skipped (empty review)" >> "$GITHUB_ENV"
+            exit 0
+          fi
 
           # Truncate to ~50 KB to stay well under GitHub's commit-comment
           # size limit (~64 KB). Real reviews are usually much smaller.
