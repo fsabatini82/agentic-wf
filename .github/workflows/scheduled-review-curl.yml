@@ -1,4 +1,4 @@
-name: Scheduled Code Review (curl variant — full control)
+name: Scheduled Code Review (curl variant gpt-5-mini — full control)
 
 # Variant B: bypass actions/ai-inference and call GitHub Models directly
 # via curl. This gives FULL control over the JSON body — including

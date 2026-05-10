@@ -1,4 +1,4 @@
-name: Scheduled Code Review (gpt-5-mini)
+name: Scheduled Code Review (gpt-4o-mini)
 
 # Weekly automated review using GitHub Models with a fixed model.
 # Architecture note: this workflow does NOT use the Copilot Coding Agent
