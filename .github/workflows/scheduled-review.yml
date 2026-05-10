@@ -31,12 +31,21 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # NOTE: openai/gpt-5-mini causes a 400 error with actions/ai-inference@v1
-      # because GPT-5 family requires `max_completion_tokens` while the action
-      # still sends the legacy `max_tokens` field. Until the action is updated,
-      # use openai/gpt-4o-mini — same low-cost tier, fully compatible.
-      # If/when the action supports GPT-5 family, switch back to openai/gpt-5-mini.
-      MODEL: openai/gpt-5-mini # MODEL: openai/gpt-4o-mini
+      # IMPORTANT — actions/ai-inference@v1 incompatibility with GPT-5 family:
+      # The action ALWAYS sends `max_tokens` (default 200 if you don't set it,
+      # otherwise your value), and there is no way to make it send
+      # `max_completion_tokens` instead. GPT-5-family models (gpt-5-mini,
+      # gpt-5-3-codex, etc.) reject `max_tokens` with HTTP 400.
+      #
+      # Tested 2026-05-10: omitting `max-tokens:` does NOT help — the action
+      # injects 200 anyway.
+      #
+      # If you want gpt-5-mini, use scheduled-review-curl.yml (Variant B)
+      # which bypasses the action and sends `max_completion_tokens` directly.
+      #
+      # On this workflow we stick with gpt-4o-mini: same low-cost tier,
+      # action works fine, no quirks.
+      MODEL: openai/gpt-4o-mini
 
     steps:
       - name: Checkout repository
@@ -87,7 +96,6 @@ jobs:
           model: ${{ env.MODEL }}
           system-prompt-file: build/code-reviewer-prompt.md
           prompt-file: build/source-bundle.md
-          # max-tokens: 1500
           # max-tokens omitted on purpose: GPT-5 family rejects `max_tokens`
           # and requires `max_completion_tokens`. Removing the input avoids
           # the conflict and lets the action use its default budget.
@@ -110,7 +118,6 @@ jobs:
           model: ${{ env.MODEL }}
           system-prompt-file: build/doc-writer-prompt.md
           prompt-file: build/source-bundle.md
-          # max-tokens: 1500
           # max-tokens omitted (see comment on previous step)
 
       - name: Save doc-writer output
