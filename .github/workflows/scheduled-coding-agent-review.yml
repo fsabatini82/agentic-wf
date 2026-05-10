@@ -1,0 +1,120 @@
+name: Scheduled Coding Agent Review (weekly via @copilot)
+
+# Schedules a weekly code review delegated to the Copilot Coding Agent.
+# Pattern: cron creates an issue with the orchestration prompt as body,
+# and assigns it to @copilot. The Coding Agent picks up the issue and
+# opens a PR with the review file.
+#
+# Difference vs scheduled-review.yml (Option B):
+#   - This one TRIGGERS the Copilot Coding Agent (server-side, multi-step).
+#   - The other calls GitHub Models directly (single-shot inference).
+#   - This one OPENS A PR; the other writes an artifact.
+#   - Model choice: this is "Auto" (CLI cannot specify); the other is pinned.
+#
+# Default cadence: Wednesday 06:00 UTC, to avoid clashing with
+# scheduled-review.yml (which runs Monday 06:00 UTC). Adjust as needed.
+
+on:
+  schedule:
+    - cron: '0 6 * * 3'      # every Wednesday at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      review_note:
+        description: "Optional note to include in the issue body (free text)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read              # to checkout the prompt file
+  issues: write               # to create the review issue
+  pull-requests: read         # to inspect Copilot's PR if needed
+
+jobs:
+  trigger-coding-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compose issue body from prompt
+        id: compose
+        run: |
+          set -euo pipefail
+          PROMPT_FILE=".github/prompts/coding-agent-review.prompt.md"
+
+          if [ ! -f "$PROMPT_FILE" ]; then
+            echo "::error::Prompt file not found: $PROMPT_FILE"
+            exit 1
+          fi
+
+          REVIEW_DATE=$(date -u +'%Y-%m-%d')
+          ISSUE_TITLE="Scheduled Code Review ${REVIEW_DATE} — use @code-reviewer agent"
+
+          {
+            echo "_Triggered by **${{ github.event_name }}** on ${REVIEW_DATE}._"
+            echo "_Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}_"
+            if [ -n "${{ github.event.inputs.review_note }}" ]; then
+              echo
+              echo "**Note from operator**: ${{ github.event.inputs.review_note }}"
+            fi
+            echo
+            echo "---"
+            echo
+            cat "$PROMPT_FILE"
+          } > issue-body.md
+
+          {
+            echo "title=${ISSUE_TITLE}"
+            echo "body_file=issue-body.md"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ensure required labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "auto-review" \
+            --description "Automated review issue / PR" \
+            --color "0E8A16" \
+            --force || true
+          gh label create "scheduled" \
+            --description "Triggered by scheduled workflow" \
+            --color "5319E7" \
+            --force || true
+
+      - name: Create issue assigned to Copilot Coding Agent
+        id: create_issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          ISSUE_URL=$(gh issue create \
+            --title "${{ steps.compose.outputs.title }}" \
+            --body-file "${{ steps.compose.outputs.body_file }}" \
+            --label "auto-review,scheduled" \
+            --assignee "@copilot")
+
+          echo "::notice::Issue created: ${ISSUE_URL}"
+          echo "ISSUE_URL=${ISSUE_URL}" >> "$GITHUB_ENV"
+
+      - name: Job summary
+        run: |
+          {
+            echo "## Coding Agent triggered"
+            echo
+            echo "- **Issue**: ${ISSUE_URL}"
+            echo "- **Assignee**: \`@copilot\` (Copilot Coding Agent)"
+            echo "- **Model**: \`Auto\` — CLI cannot specify model as of 2026-05"
+            echo "- **Expected**: a PR with \`out/code-review.md\` will be opened by the agent within 5–15 min"
+            echo
+            echo "### What happens next"
+            echo
+            echo "1. Copilot Coding Agent reads the issue and \`.github/agents/code-reviewer.agent.md\`"
+            echo "2. The agent walks the codebase, applies the checklist"
+            echo "3. The agent writes the review to \`out/code-review.md\` on a temporary branch"
+            echo "4. The agent opens a PR with label \`auto-review\` linked to the issue"
+            echo "5. (Optional) Run a second workflow on the PR to upload the report externally"
+            echo
+            echo "Track progress on the issue page or in this repo's [Pull Requests](${{ github.server_url }}/${{ github.repository }}/pulls?q=label%3Aauto-review)."
+          } >> "$GITHUB_STEP_SUMMARY"
