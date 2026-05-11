@@ -4,3 +4,4 @@ obj/
 .vs/
 out/*.md
 !out/.gitkeep
+!out/code-review.md
