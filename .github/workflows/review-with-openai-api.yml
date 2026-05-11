@@ -1,0 +1,179 @@
+name: Review with OpenAI API direct (Option C — OpenAI)
+
+# Option C — Direct API call to OpenAI, bypassing both Copilot Coding Agent
+# and GitHub Models. Full control of model, parameters, and billing.
+#
+# Use this when:
+#   - you have your own OpenAI account with a separate quota
+#   - you want a model not yet in the GitHub Models catalog
+#   - you want costs billed to OpenAI (separate from Copilot AI Credits)
+#
+# Cost model: pay-per-token directly to OpenAI. Check usage at
+#   https://platform.openai.com/usage
+#
+# Required secret (Settings → Secrets and variables → Actions):
+#   OPENAI_API_KEY  — generate at https://platform.openai.com/api-keys
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "OpenAI model"
+        required: false
+        default: "gpt-4o-mini"
+        type: choice
+        options:
+          - "gpt-4o-mini"        # cheapest, ~$0.15/$0.60 per 1M tok
+          - "gpt-4o"             # mid-tier, ~$2.50/$10 per 1M tok
+          - "gpt-5-mini"         # reasoning, ~$0.25/$2 per 1M tok
+          - "gpt-5.3-codex"      # engineering-tuned, ~$1.75/$14 per 1M tok
+          - "o3-mini"            # reasoning, ~$1.10/$4.40 per 1M tok
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    env:
+      ENDPOINT: https://api.openai.com/v1/chat/completions
+      OUTPUT_BUDGET: '6000'           # max tokens for the response
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare working directories
+        run: mkdir -p build out
+
+      - name: Verify OPENAI_API_KEY is set
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY secret is missing."
+            echo "Add it via: Settings → Secrets and variables → Actions → New repository secret"
+            echo "Generate a key at: https://platform.openai.com/api-keys"
+            exit 1
+          fi
+          echo "::notice::OPENAI_API_KEY present (length: ${#OPENAI_API_KEY})"
+
+      - name: Bundle C# source files
+        run: |
+          {
+            echo "Review the following C# project according to your system instructions."
+            echo
+            for f in $(find . -maxdepth 2 -name '*.cs' | sort); do
+              echo "## File: $f"
+              echo '```csharp'
+              cat "$f"
+              echo '```'
+              echo
+            done
+          } > build/source-bundle.md
+
+      - name: Extract code-reviewer agent prompt
+        run: |
+          awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' \
+            .github/agents/code-reviewer.agent.md > build/code-reviewer-prompt.md
+
+      - name: Call OpenAI Chat Completions
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODEL: ${{ github.event.inputs.model || 'gpt-4o-mini' }}
+        run: |
+          set -euo pipefail
+
+          # ----------------------------------------------------------
+          # Parameter quirks per model family:
+          #   GPT-5 / o-series : need `max_completion_tokens` + supports
+          #                      `reasoning_effort`. Reject `max_tokens`.
+          #   GPT-4 / GPT-3.5  : use legacy `max_tokens`.
+          # ----------------------------------------------------------
+          if [[ "${MODEL}" == gpt-5* ]] || [[ "${MODEL}" == o3* ]] || [[ "${MODEL}" == o1* ]] || [[ "${MODEL}" == o4* ]]; then
+            BUDGET_FIELD="max_completion_tokens"
+            EXTRA='{"reasoning_effort":"low"}'
+          else
+            BUDGET_FIELD="max_tokens"
+            EXTRA='{}'
+          fi
+
+          BASE=$(jq -n \
+            --arg model "${MODEL}" \
+            --arg sys "$(cat build/code-reviewer-prompt.md)" \
+            --arg usr "$(cat build/source-bundle.md)" \
+            '{
+               model: $model,
+               messages: [
+                 {role: "system", content: $sys},
+                 {role: "user",   content: $usr}
+               ]
+             }')
+
+          PAYLOAD=$(echo "${BASE}" \
+            | jq --argjson budget ${OUTPUT_BUDGET} --arg field "${BUDGET_FIELD}" '. + {($field): $budget}' \
+            | jq --argjson extra "${EXTRA}" '. + $extra')
+
+          echo "Calling ${ENDPOINT} (model=${MODEL}, budget_field=${BUDGET_FIELD})"
+
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" \
+            -X POST "${ENDPOINT}" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}")
+
+          echo "HTTP ${HTTP_CODE}"
+          if [ "${HTTP_CODE}" -ne 200 ]; then
+            echo "::error::API call failed (HTTP ${HTTP_CODE})"
+            cat response.json
+            exit 1
+          fi
+
+          # -- Diagnostics ------------------------------------------------
+          FINISH=$(jq -r '.choices[0].finish_reason // "unknown"' response.json)
+          IN_T=$(jq -r '.usage.prompt_tokens // 0' response.json)
+          OUT_T=$(jq -r '.usage.completion_tokens // 0' response.json)
+          REASONING_T=$(jq -r '.usage.completion_tokens_details.reasoning_tokens // 0' response.json)
+          echo "Finish: ${FINISH} | input=${IN_T} | output=${OUT_T} | reasoning=${REASONING_T}"
+
+          jq -r '.choices[0].message.content // ""' response.json > out/code-review.md
+          CONTENT_BYTES=$(wc -c < out/code-review.md)
+
+          if [ "${CONTENT_BYTES}" -lt 100 ]; then
+            echo "::warning::Output near-empty (${CONTENT_BYTES} bytes)."
+            [ "${REASONING_T}" -gt 0 ] && \
+              echo "::warning::Reasoning consumed ${REASONING_T} tokens — bump OUTPUT_BUDGET."
+          fi
+
+          if [ "${FINISH}" = "length" ]; then
+            echo "::warning::finish_reason=length — output truncated by token cap."
+          fi
+
+          echo "::notice::Code review written (${CONTENT_BYTES} bytes, $(wc -l < out/code-review.md) lines)"
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-openai-${{ github.run_id }}
+          path: out/
+          retention-days: 7
+
+      - name: Job summary
+        env:
+          MODEL: ${{ github.event.inputs.model || 'gpt-4o-mini' }}
+        run: |
+          {
+            echo "## OpenAI API direct — review complete"
+            echo
+            echo "- **Provider**: OpenAI (direct API, no Copilot/GitHub Models)"
+            echo "- **Endpoint**: \`${ENDPOINT}\`"
+            echo "- **Model**: \`${MODEL}\`"
+            echo "- **Billing**: [platform.openai.com/usage](https://platform.openai.com/usage)"
+            echo
+            echo "### Review (preview)"
+            echo
+            head -40 out/code-review.md || true
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,169 @@
+name: Review with Claude API direct (Option C — Anthropic)
+
+# Option C — Direct API call to Anthropic, bypassing Copilot and GitHub Models.
+# Useful when:
+#   - you have your own Anthropic account and quota
+#   - you want pure Claude Opus 4.7 (no Copilot 27x cost multiplier)
+#   - you need the latest Claude model the same day it ships,
+#     without waiting for the GitHub Models catalog to pick it up
+#
+# Cost model: pay-per-token directly to Anthropic. Check usage at
+#   https://console.anthropic.com/usage
+#
+# Required secret (Settings → Secrets and variables → Actions):
+#   ANTHROPIC_API_KEY  — generate at https://console.anthropic.com/settings/keys
+#
+# NOTE — Anthropic API differs from OpenAI's in 3 important ways:
+#   1. `system` is a TOP-LEVEL field, not a message in the messages[] array
+#   2. `max_tokens` is REQUIRED (not optional like OpenAI)
+#   3. Response shape: `content[0].text` (vs OpenAI `choices[0].message.content`)
+#   4. Header: `x-api-key` + `anthropic-version` (vs OpenAI `Authorization: Bearer`)
+#
+# These differences are why a "provider abstraction layer" usually requires
+# more glue than swapping endpoints.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Anthropic Claude model"
+        required: false
+        default: "claude-haiku-4-5"
+        type: choice
+        options:
+          - "claude-haiku-4-5"     # cheapest, ~$0.80/$4 per 1M tok
+          - "claude-sonnet-4-6"    # balanced, ~$3/$15 per 1M tok
+          - "claude-opus-4-7"      # premium, ~$5/$25 per 1M tok
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    env:
+      ENDPOINT: https://api.anthropic.com/v1/messages
+      ANTHROPIC_VERSION: '2023-06-01'   # API version header (Anthropic-specific)
+      MAX_TOKENS: '4000'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare working directories
+        run: mkdir -p build out
+
+      - name: Verify ANTHROPIC_API_KEY is set
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is missing."
+            echo "Add it via: Settings → Secrets and variables → Actions → New repository secret"
+            echo "Generate a key at: https://console.anthropic.com/settings/keys"
+            exit 1
+          fi
+          echo "::notice::ANTHROPIC_API_KEY present (length: ${#ANTHROPIC_API_KEY})"
+
+      - name: Bundle C# source files
+        run: |
+          {
+            echo "Review the following C# project according to your system instructions."
+            echo
+            for f in $(find . -maxdepth 2 -name '*.cs' | sort); do
+              echo "## File: $f"
+              echo '```csharp'
+              cat "$f"
+              echo '```'
+              echo
+            done
+          } > build/source-bundle.md
+
+      - name: Extract code-reviewer agent prompt
+        run: |
+          awk 'BEGIN{n=0} /^---$/{n++; next} n>=2{print}' \
+            .github/agents/code-reviewer.agent.md > build/code-reviewer-prompt.md
+
+      - name: Call Anthropic Messages API
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MODEL: ${{ github.event.inputs.model || 'claude-haiku-4-5' }}
+        run: |
+          set -euo pipefail
+
+          # Anthropic shape: system is top-level, messages[] only has user/assistant.
+          PAYLOAD=$(jq -n \
+            --arg model "${MODEL}" \
+            --arg sys "$(cat build/code-reviewer-prompt.md)" \
+            --arg usr "$(cat build/source-bundle.md)" \
+            --argjson budget ${MAX_TOKENS} \
+            '{
+               model: $model,
+               max_tokens: $budget,
+               system: $sys,
+               messages: [
+                 {role: "user", content: $usr}
+               ]
+             }')
+
+          echo "Calling ${ENDPOINT} (model=${MODEL})"
+
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" \
+            -X POST "${ENDPOINT}" \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: ${ANTHROPIC_VERSION}" \
+            -H "Content-Type: application/json" \
+            -d "${PAYLOAD}")
+
+          echo "HTTP ${HTTP_CODE}"
+          if [ "${HTTP_CODE}" -ne 200 ]; then
+            echo "::error::API call failed (HTTP ${HTTP_CODE})"
+            cat response.json
+            exit 1
+          fi
+
+          # -- Diagnostics (Anthropic response shape) ---------------------
+          STOP_REASON=$(jq -r '.stop_reason // "unknown"' response.json)
+          IN_T=$(jq -r '.usage.input_tokens // 0' response.json)
+          OUT_T=$(jq -r '.usage.output_tokens // 0' response.json)
+          echo "Stop reason: ${STOP_REASON} | input=${IN_T} | output=${OUT_T}"
+
+          # Content lives at .content[0].text (not .choices[0].message.content!)
+          jq -r '.content[0].text // ""' response.json > out/code-review.md
+          CONTENT_BYTES=$(wc -c < out/code-review.md)
+
+          if [ "${CONTENT_BYTES}" -lt 100 ]; then
+            echo "::warning::Output near-empty (${CONTENT_BYTES} bytes)."
+          fi
+          if [ "${STOP_REASON}" = "max_tokens" ]; then
+            echo "::warning::stop_reason=max_tokens — output truncated. Increase MAX_TOKENS."
+          fi
+
+          echo "::notice::Code review written (${CONTENT_BYTES} bytes, $(wc -l < out/code-review.md) lines)"
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-claude-${{ github.run_id }}
+          path: out/
+          retention-days: 7
+
+      - name: Job summary
+        env:
+          MODEL: ${{ github.event.inputs.model || 'claude-haiku-4-5' }}
+        run: |
+          {
+            echo "## Anthropic Claude API direct — review complete"
+            echo
+            echo "- **Provider**: Anthropic (direct API, no Copilot/GitHub Models)"
+            echo "- **Endpoint**: \`${ENDPOINT}\`"
+            echo "- **Model**: \`${MODEL}\`"
+            echo "- **Billing**: [console.anthropic.com/usage](https://console.anthropic.com/usage)"
+            echo
+            echo "### Review (preview)"
+            echo
+            head -40 out/code-review.md || true
+          } >> "$GITHUB_STEP_SUMMARY"

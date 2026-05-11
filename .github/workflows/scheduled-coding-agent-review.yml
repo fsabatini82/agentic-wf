@@ -71,6 +71,7 @@ jobs:
 
       - name: Ensure required labels exist
         env:
+          # Labels can be created with the default GITHUB_TOKEN (App token works fine here)
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh label create "auto-review" \
@@ -82,10 +83,40 @@ jobs:
             --color "5319E7" \
             --force || true
 
+      - name: Verify COPILOT_ASSIGN_PAT is set
+        env:
+          COPILOT_ASSIGN_PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          # KNOWN LIMITATION (May 2026): assigning @copilot to an issue requires
+          # a USER token. The default GITHUB_TOKEN is an App installation token
+          # and GitHub rejects it on the GraphQL replaceActorsForAssignable mutation
+          # with: "Assigning agents is not supported with GitHub App installation tokens."
+          #
+          # Workaround: a Personal Access Token (PAT) scoped to this repo with
+          # Issues:write + Pull requests:read permissions.
+          #
+          # Setup (one-time):
+          #   1. github.com/settings/personal-access-tokens → Generate new token (fine-grained)
+          #   2. Resource owner: <your account or org>
+          #   3. Repository access: Only select repositories → agentic-wf
+          #   4. Permissions → Repository → Issues: Read and write, Pull requests: Read
+          #   5. Generate, copy
+          #   6. Repo → Settings → Secrets and variables → Actions → New secret
+          #      Name: COPILOT_ASSIGN_PAT  ·  Value: <paste token>
+          if [ -z "${COPILOT_ASSIGN_PAT:-}" ]; then
+            echo "::error::Secret COPILOT_ASSIGN_PAT is missing."
+            echo "The default GITHUB_TOKEN cannot assign @copilot (App token limitation)."
+            echo "Generate a fine-grained PAT and add it as repo secret COPILOT_ASSIGN_PAT."
+            echo "See the workflow step comments above for the exact setup procedure."
+            exit 1
+          fi
+          echo "::notice::COPILOT_ASSIGN_PAT present (length: ${#COPILOT_ASSIGN_PAT})"
+
       - name: Create issue assigned to Copilot Coding Agent
         id: create_issue
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # USER token here, not the default GITHUB_TOKEN — see check step above.
+          GH_TOKEN: ${{ secrets.COPILOT_ASSIGN_PAT }}
         run: |
           set -euo pipefail
 
