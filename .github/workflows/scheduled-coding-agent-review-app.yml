@@ -1,0 +1,185 @@
+name: Scheduled Coding Agent Review (enterprise — GitHub App + Service Account)
+
+# Enterprise variant. Two tokens used in this workflow:
+#
+#   1. GitHub App installation token (minted at run-time via actions/create-github-app-token)
+#      → used for labels, audit comments, future repo operations.
+#      → org-owned, centrally rotated, audited via App's installation events.
+#
+#   2. Service account PAT (token from a dedicated "bot" GitHub user)
+#      → used ONLY for assigning @copilot to the issue.
+#      → required because the GraphQL replaceActorsForAssignable mutation
+#        rejects App installation tokens with:
+#          "Assigning agents is not supported with GitHub App installation tokens."
+#
+# Why hybrid (and not pure App-only)?
+# As of May 2026 GitHub does not allow App installation tokens to assign
+# agentic actors. A user-context token is required. A dedicated service
+# account is preferable to a personal PAT because:
+#   - no human owner (no break when an employee leaves)
+#   - centrally rotated by the org admin
+#   - minimal scope (single repo, single permission)
+#   - clearly named in audit logs
+#
+# See ENTERPRISE-SETUP.md (in the parent folder) for step-by-step setup
+# of both the App and the service account, via UI and Terraform.
+
+on:
+  schedule:
+    - cron: '0 6 * * 3'
+  workflow_dispatch:
+    inputs:
+      review_note:
+        description: "Optional note in the issue body"
+        required: false
+        default: ""
+
+permissions: {}   # default GITHUB_TOKEN unused — we mint our own tokens
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # =========================================================
+      # Step 1 — Mint a GitHub App installation token
+      # =========================================================
+      - name: Generate GitHub App installation token
+        id: app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.REVIEW_APP_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          # Optional — limit to specific repo (defaults to "all the App is installed on")
+          # repositories: ${{ github.event.repository.name }}
+
+      - name: Compose issue body
+        id: compose
+        run: |
+          set -euo pipefail
+          PROMPT_FILE=".github/prompts/coding-agent-review.prompt.md"
+
+          if [ ! -f "$PROMPT_FILE" ]; then
+            echo "::error::Prompt file not found: $PROMPT_FILE"
+            exit 1
+          fi
+
+          REVIEW_DATE=$(date -u +'%Y-%m-%d')
+          ISSUE_TITLE="Scheduled Code Review ${REVIEW_DATE} — use @code-reviewer agent"
+
+          {
+            echo "_Triggered by **${{ github.event_name }}** on ${REVIEW_DATE}._"
+            echo "_Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}_"
+            if [ -n "${{ github.event.inputs.review_note }}" ]; then
+              echo
+              echo "**Note from operator**: ${{ github.event.inputs.review_note }}"
+            fi
+            echo
+            echo "---"
+            echo
+            cat "$PROMPT_FILE"
+          } > issue-body.md
+
+          {
+            echo "title=${ISSUE_TITLE}"
+            echo "body_file=issue-body.md"
+          } >> "$GITHUB_OUTPUT"
+
+      # =========================================================
+      # Step 2 — Labels via App installation token
+      # (App tokens work fine for label/comment ops; only @copilot
+      #  assignment is restricted to user tokens.)
+      # =========================================================
+      - name: Ensure required labels exist (via App token)
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          gh label create "auto-review" \
+            --description "Automated review issue / PR" \
+            --color "0E8A16" \
+            --force || true
+          gh label create "scheduled" \
+            --description "Triggered by scheduled workflow" \
+            --color "5319E7" \
+            --force || true
+
+      # =========================================================
+      # Step 3 — Validate the service account PAT is configured
+      # =========================================================
+      - name: Verify service account PAT is set
+        env:
+          COPILOT_ASSIGN_PAT: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          if [ -z "${COPILOT_ASSIGN_PAT:-}" ]; then
+            echo "::error::Secret COPILOT_ASSIGN_PAT (org-level) is missing."
+            echo "This must be a fine-grained PAT generated from a DEDICATED service account user,"
+            echo "scoped to this repo with permissions: Issues:write + Pull requests:read."
+            echo "See ENTERPRISE-SETUP.md for the full procedure."
+            exit 1
+          fi
+          echo "::notice::Service account PAT present (length: ${#COPILOT_ASSIGN_PAT})"
+
+      # =========================================================
+      # Step 4 — Create issue assigned to @copilot using PAT
+      # =========================================================
+      - name: Create issue assigned to Copilot Coding Agent
+        id: create_issue
+        env:
+          # Service account PAT — required, App tokens fail here
+          GH_TOKEN: ${{ secrets.COPILOT_ASSIGN_PAT }}
+        run: |
+          set -euo pipefail
+
+          ISSUE_URL=$(gh issue create \
+            --title "${{ steps.compose.outputs.title }}" \
+            --body-file "${{ steps.compose.outputs.body_file }}" \
+            --label "auto-review,scheduled" \
+            --assignee "@copilot")
+
+          echo "::notice::Issue created: ${ISSUE_URL}"
+          echo "ISSUE_URL=${ISSUE_URL}" >> "$GITHUB_ENV"
+
+      # =========================================================
+      # Step 5 — Audit comment using App token
+      # Demonstrates that App token works for non-assignment ops.
+      # =========================================================
+      - name: Post audit comment via App token
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          ISSUE_NUM=$(echo "${ISSUE_URL}" | awk -F/ '{print $NF}')
+
+          gh issue comment "${ISSUE_NUM}" --body "$(cat <<EOF
+_🤖 Audit trail (posted by GitHub App, App ID \`${{ vars.REVIEW_APP_ID }}\`):_
+
+- **Triggered by**: workflow run \`${{ github.run_id }}\` ([open](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}))
+- **Repo**: \`${{ github.repository }}\`
+- **Commit SHA**: \`${{ github.sha }}\`
+- **Assignment token type**: service account PAT (\`@copilot\` assignment requires user-context token)
+- **Audit token type**: GitHub App installation token
+EOF
+)"
+
+      - name: Job summary
+        run: |
+          {
+            echo "## Coding Agent triggered (enterprise — GitHub App + Service Account)"
+            echo
+            echo "- **Issue**: ${ISSUE_URL}"
+            echo "- **Assignee**: \`@copilot\` (assigned via service account PAT)"
+            echo "- **Labels added via**: GitHub App installation token"
+            echo "- **Audit comment via**: GitHub App installation token"
+            echo "- **App ID**: \`${{ vars.REVIEW_APP_ID }}\`"
+            echo
+            echo "### Token usage summary"
+            echo
+            echo "| Operation | Token used | Why |"
+            echo "|-----------|------------|-----|"
+            echo "| Create labels | App installation | Standard repo op, App token sufficient |"
+            echo "| Assign \`@copilot\` | Service account PAT | App tokens rejected by GitHub API |"
+            echo "| Audit comment | App installation | Centralised in App's audit log |"
+          } >> "$GITHUB_STEP_SUMMARY"
