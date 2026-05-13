@@ -3,4 +3,5 @@ obj/
 *.user
 .vs/
 out/*.md
+!out/code-review.md
 !out/.gitkeep
